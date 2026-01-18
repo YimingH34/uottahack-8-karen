@@ -140,6 +140,19 @@ module video_uut (
         $readmemh("logo_rom.mem", logo_rom);
     end
     
+    // =========== PLANKTON ROMs (for Win/Lose screens) ===========
+    localparam PLANKTON_WIDTH  = 400;     // Plankton image width in pixels
+    localparam PLANKTON_HEIGHT = 340;     // Plankton image height in pixels
+    localparam PLANKTON_PIXELS = PLANKTON_WIDTH * PLANKTON_HEIGHT;  // 136000 pixels
+    
+    // Plankton ROM storage (25-bit: bit24=visible, bits23:0=RGB)
+    reg [24:0] plankton_win_rom  [0:PLANKTON_PIXELS-1];
+    reg [24:0] plankton_lose_rom [0:PLANKTON_PIXELS-1];
+    initial begin
+        $readmemh("plankton_win.mem", plankton_win_rom);
+        $readmemh("plankton_lose.mem", plankton_lose_rom);
+    end
+    
     // =========== BREAKOUT GAME (State 5) ===========
     // Game area parameters
     localparam GAME_LEFT   = 160;        // Left margin
@@ -803,6 +816,7 @@ module video_uut (
                 logic draw_endgame_box, draw_endgame_text;
                 logic [11:0] box_left, box_right, box_top, box_bottom;
                 logic [11:0] text_x, text_y;
+                logic [23:0] plankton_color;  // RGB color from plankton ROM
                 
                 draw_ball = 1'b0;
                 draw_paddle = 1'b0;
@@ -885,56 +899,47 @@ module video_uut (
                     end
                 end
                 
-                // Game over / You win display (centered box)
+                // Game over / You win display (centered plankton image)
                 draw_endgame_box = 1'b0;
                 draw_endgame_text = 1'b0;
                 
-                // Box dimensions: 600x200, centered
-                box_left = (H_RES - 600) / 2;
-                box_right = box_left + 600;
-                box_top = (V_RES - 200) / 2;
-                box_bottom = box_top + 200;
+                // Plankton image centered on screen
+                box_left = (H_RES - PLANKTON_WIDTH) / 2;   // 760
+                box_right = box_left + PLANKTON_WIDTH;      // 1160
+                box_top = (V_RES - PLANKTON_HEIGHT) / 2;    // 370
+                box_bottom = box_top + PLANKTON_HEIGHT;     // 710
                 
                 if (game_paused) begin
                     if (x_cnt >= box_left && x_cnt < box_right &&
                         y_cnt >= box_top && y_cnt < box_bottom) begin
-                        // Border (15px thick)
-                        if (x_cnt < box_left + 15 || x_cnt >= box_right - 15 ||
-                            y_cnt < box_top + 15 || y_cnt >= box_bottom - 15) begin
-                            draw_endgame_box = 1'b1;
+                        // Calculate local coordinates within plankton image
+                        logic [11:0] plankton_local_x, plankton_local_y;
+                        logic [16:0] plankton_addr;
+                        logic [24:0] plankton_pixel;
+                        
+                        plankton_local_x = x_cnt - box_left;
+                        plankton_local_y = y_cnt - box_top;
+                        plankton_addr = plankton_local_y * PLANKTON_WIDTH + plankton_local_x;
+                        
+                        // Lookup pixel from appropriate ROM
+                        if (game_won) begin
+                            plankton_pixel = plankton_win_rom[plankton_addr];
                         end
                         else begin
-                            // Inner area = 570 x 170, centered text
-                            text_x = x_cnt - box_left - 15;
-                            text_y = y_cnt - box_top - 15;
-                            // Draw large text indicators
-                            if (game_won) begin
-                                // Three tall vertical bars for WIN (spread across 570px)
-                                // Bar 1: 80-130, Bar 2: 255-305, Bar 3: 430-480
-                                if (((text_x >= 80 && text_x < 130) ||
-                                     (text_x >= 255 && text_x < 305) ||
-                                     (text_x >= 430 && text_x < 480)) &&
-                                    (text_y >= 30 && text_y < 140)) begin
-                                    draw_endgame_text = 1'b1;
-                                end
-                            end
-                            else begin
-                                // Large horizontal bar across middle for LOSE
-                                if (text_x >= 50 && text_x < 520 &&
-                                    text_y >= 65 && text_y < 105) begin
-                                    draw_endgame_text = 1'b1;
-                                end
-                            end
+                            plankton_pixel = plankton_lose_rom[plankton_addr];
+                        end
+                        
+                        // Check visibility bit (bit 24)
+                        if (plankton_pixel[24]) begin
+                            draw_endgame_box = 1'b1;  // Flag to indicate plankton pixel visible
+                            plankton_color = plankton_pixel[23:0];  // Store RGB color
                         end
                     end
                 end
                 
                 // Draw priority: EndGame > Ball > Paddle > Blocks > GUI > Background
                 if (draw_endgame_box) begin
-                    vid_rgb_d1 <= game_won ? 24'h00FF00 : 24'hFF0000;  // Green for win, red for lose
-                end
-                else if (draw_endgame_text) begin
-                    vid_rgb_d1 <= 24'hFFFFFF;  // White text
+                    vid_rgb_d1 <= plankton_color;  // Use actual color from plankton ROM
                 end
                 else if (draw_ball) begin
                     vid_rgb_d1 <= 24'hFFFFFF;  // White ball
