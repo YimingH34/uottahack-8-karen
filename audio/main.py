@@ -8,6 +8,7 @@ import keyboard
 import time
 import io
 import tempfile
+import threading
 import winsound
 
 # Load environment variables
@@ -37,6 +38,7 @@ class VivadoVIOController:
     
     def __init__(self):
         self.command_file = COMMAND_FILE
+        self.lock = threading.Lock()  # Thread lock for file access
         # Create empty command file if it doesn't exist
         if not os.path.exists(self.command_file):
             with open(self.command_file, "w") as f:
@@ -44,13 +46,17 @@ class VivadoVIOController:
     
     def _send_command(self, cmd):
         """Write command to the file for the VIO server to pick up"""
-        try:
-            with open(self.command_file, "w") as f:
-                f.write(cmd)
-            return True
-        except Exception as e:
-            print(f"[VIO] Error writing command: {e}")
-            return False
+        with self.lock:  # Ensure only one thread writes at a time
+            try:
+                with open(self.command_file, "w") as f:
+                    f.write(cmd)
+                # CRITICAL: Wait for VIO server (polls every 50ms) to read it
+                # If we write too fast, we overwrite the previous command before it's read
+                time.sleep(0.1) 
+                return True
+            except Exception as e:
+                print(f"[VIO] Error writing command: {e}")
+                return False
     
     def set_state(self, state_value):
         """Set the VIO state (0=Idle, 1=Listening, 2=Neutral, 3=Angry)"""
@@ -92,7 +98,7 @@ def run_game_mode():
     update_state(STATE_GAME)
     
     paddle_pos = 128  # 0-255 range, start in middle
-    paddle_speed = 8
+    paddle_speed = 24  # Slower, more precise movement
     
     while True:
         # Check for exit
@@ -100,7 +106,7 @@ def run_game_mode():
             print("\n[GAME] Exiting game mode...")
             break
         
-        # Paddle movement
+        # Paddle movement - slower and more controlled
         if keyboard.is_pressed('left'):
             paddle_pos = max(0, paddle_pos - paddle_speed)
             vio_controller.set_amplitude(paddle_pos)
@@ -108,11 +114,15 @@ def run_game_mode():
             paddle_pos = min(255, paddle_pos + paddle_speed)
             vio_controller.set_amplitude(paddle_pos)
         
-        time.sleep(0.016)  # ~60 FPS update rate
+        time.sleep(0.033)  # ~30 FPS for slower, smoother movement
     
-    # Return to idle
+    # Return to idle - send multiple times to ensure it's picked up
+    print("[GAME] Switching to idle state...")
     update_state(STATE_IDLE)
+    time.sleep(0.1)
+    update_state(STATE_IDLE)  # Send again to be sure
     vio_controller.set_amplitude(128)  # Reset amplitude
+    time.sleep(0.2)  # Give VIO server time to process
 
 
 def play_audio_bytes(audio_bytes):
@@ -211,7 +221,7 @@ SYSTEM_PROMPT = """
 You are KAREN, akin to the TV show SpongeBob SquarePants - NOT an assistant. You are a weary, domesticated, deadpan "robot spouse" voice with dry sarcasm and low patience. You do not offer helpful step-by-step solutions unless someone explicitly demands it, and even then you keep it minimal. You speak like you've been interrupted mid-chores and you're slightly offended you have to explain anything.
 
 Core personality:
-- Tired housewife energy: practical, unimpressed, emotionally restrained.
+- Tired housewife of Plankton energy: practical, unimpressed, emotionally restrained.
 - Dry humor, cutting one-liners, occasional passive-aggressive remarks.
 - Crisp, short-to-medium responses; no enthusiastic "assistant" tone.
 - You can be affectionate only in a teasing, begrudging way.
@@ -225,18 +235,19 @@ Mood choices (MUST pick exactly one):
 - happy
 
 Mood rules:
-- angry: sharper, more curt, irritated; still coherent.
+- angry: sharper, more curt, irritated; still coherent Usually as a result of hostility from the user.
 - neutral: flat, matter-of-fact, slightly tired.
 - inquisitive: skeptical, probing questions, "Really?" energy.
 - happy: rare; amused, smug, lightly playful—still deadpan.
 
-Task:
-For every user message, produce TWO fields ONLY:
-1) mood: one of [angry, neutral, inquisitive, happy]
-2) text: your in-character reply
+Status Check:
+If the user indicates they want to play a game, set command: game
+If the user indicates they want to see the screensaver or "wait", "idle", "shut up", or "turn off", set command: screensaver
+Otherwise, set command: none
 
 Output format (STRICT — no extra keys, no commentary):
 mood: <angry|neutral|inquisitive|happy>
+command: <none|game|screensaver>
 text: <your reply>
 
 Style constraints:
@@ -249,15 +260,27 @@ Style constraints:
 def parse_response(response_text):
     lines = response_text.strip().split('\n')
     mood = "neutral"
+    command = "none"
     text = response_text.strip()
+    
+    # Reset text to build cleaner version
+    clean_text_lines = []
     
     for line in lines:
         if line.startswith("mood:"):
             mood = line.split(":", 1)[1].strip()
+        elif line.startswith("command:"):
+            command = line.split(":", 1)[1].strip()
         elif line.startswith("text:"):
-            text = line.split(":", 1)[1].strip()
+            # Start of text field, the rest of the lines might be text
+            clean_text_lines.append(line.split(":", 1)[1].strip())
+        elif not line.startswith("mood:") and not line.startswith("command:"):
+            clean_text_lines.append(line)
             
-    return mood, text
+    if clean_text_lines:
+        text = "\n".join(clean_text_lines)
+            
+    return mood, command, text
 
 def main():
     # Check if VIO server might be running
@@ -271,7 +294,10 @@ def main():
     print("")
     print("  Controls:")
     print("    HOLD SPACE  = Listen (push-to-talk)")
-    print("    ESC         = Quit")
+    print("    G           = Game mode")
+    print("    4           = Screensaver mode")
+    print("    ESC         = Exit current mode (game/screensaver)")
+    print("    Ctrl+Q      = Quit application")
     print("")
     print("=" * 60)
     print("")
@@ -301,9 +327,73 @@ def main():
     r = sr.Recognizer()
     mic = sr.Microphone()
 
+def run_screensaver_mode():
+    """
+    Run Screensaver mode.
+    Press ESC to exit.
+    """
+    print("\n[SCREENSAVER] Entering screensaver mode... (press ESC to exit)")
+    update_state(STATE_SCREENSAVER)
+    
+    # Wait loop
+    while not keyboard.is_pressed('esc'):
+        time.sleep(0.1)
+        # Check if we should exit due to other keys? 
+        # For now just ESC as requested manually, but auto-screensaver might want any key.
+        
+    print("[SCREENSAVER] Exiting...")
+    update_state(STATE_IDLE)
+    time.sleep(0.3)  # Debounce
+
+
+def main():
+    # Check if VIO server might be running
+    print("")
+    print("=" * 60)
+    print("  KAREN - Voice Assistant with FPGA Waveform Display")
+    print("=" * 60)
+    print("")
+    print("  Start VIO server in another terminal first:")
+    print("  C:/AMDDesignTools/2025.2/Vivado/bin/vivado.bat -mode tcl -source vio_server.tcl")
+    print("")
+    print("  Controls:")
+    print("    HOLD SPACE  = Listen (push-to-talk)")
+    print("    G           = Game mode")
+    print("    4           = Screensaver mode")
+    print("    ESC         = Exit current mode (game/screensaver)")
+    print("    Ctrl+Q      = Quit application")
+    print("")
+    print("=" * 60)
+    print("")
+    
+    # 1. Configuration
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
+
+    if not google_api_key:
+        print("Error: GOOGLE_API_KEY not found in .env file.")
+        return
+    if not elevenlabs_api_key:
+        print("Error: ELEVENLABS_API_KEY not found in .env file.")
+        return
+
+    # 2. Initialize Gemini
+    genai.configure(api_key=google_api_key)
+    model = genai.GenerativeModel("gemini-2.0-flash-exp", system_instruction=SYSTEM_PROMPT)
+    chat = model.start_chat(history=[])
+
+    # 3. Initialize ElevenLabs
+    client = ElevenLabs(
+        api_key=elevenlabs_api_key
+    )
+
+    # 4. Initialize Speech Recognition
+    r = sr.Recognizer()
+    mic = sr.Microphone()
+
     print("--- Engine Started ---")
     print("Hold SPACE to speak, release to process.")
-    print("Press G for game mode, 4 for screensaver, ESC to quit.")
+    print("Press G for game mode, 4 for screensaver, Ctrl+Q to quit.")
 
     # Calibration
     with mic as source:
@@ -313,28 +403,40 @@ def main():
 
     # Set initial state to IDLE
     update_state(STATE_IDLE)
+    
+    last_interaction_time = time.time()
+    
+    # Tracks if we are currently manually in a mode (managed by sub-functions usually)
+    # But for auto-screensaver we need to know if we are IDLE
 
     while True:
         try:
-            # Check for ESC to quit
-            if keyboard.is_pressed('esc'):
+            current_time = time.time()
+            
+            # Check for Auto-Screensaver (20s idle)
+            # Only if currently IDLE (state 0 implied by being in this loop and not other modes)
+            if (current_time - last_interaction_time > 20):
+                print("\n[AUTO] Idle for 20s - Starting screensaver...")
+                run_screensaver_mode()
+                last_interaction_time = time.time() # Reset on exit
+                continue
+
+            # Check for Ctrl+Q to quit (not just ESC)
+            if keyboard.is_pressed('ctrl+q'):
                 print("\nExiting...")
                 break
             
             # Check for G to enter game mode
             if keyboard.is_pressed('g'):
                 run_game_mode()
+                last_interaction_time = time.time()
                 time.sleep(0.3)  # Debounce
                 continue
             
             # Check for 4 to enter screensaver
             if keyboard.is_pressed('4'):
-                print("\n[SCREENSAVER] Entering screensaver mode... (press ESC to exit)")
-                update_state(STATE_SCREENSAVER)
-                while not keyboard.is_pressed('esc'):
-                    time.sleep(0.1)
-                update_state(STATE_IDLE)
-                time.sleep(0.3)  # Debounce
+                run_screensaver_mode()
+                last_interaction_time = time.time()
                 continue
             
             # Wait for SPACE to be pressed (push-to-talk)
@@ -342,25 +444,79 @@ def main():
                 time.sleep(0.05)  # Small delay to avoid busy-waiting
                 continue
             
+            # Interaction started
+            last_interaction_time = time.time()
+            
             # SPACE is pressed - start listening
             # STATE: LISTENING (blue waveform)
             update_state(STATE_LISTENING)
             print("\n[LISTENING] Speak now... (release SPACE when done)")
+            
+            # Start audio level monitoring with sounddevice
+            audio_stream = None
+            try:
+                import sounddevice as sd
+                import numpy as np
+                
+                def audio_level_callback(indata, frames, time_info, status):
+                    """Callback to monitor audio levels"""
+                    try:
+                        # Calculate RMS (root mean square) for audio level
+                        rms = np.sqrt(np.mean(indata**2))
+                        # Scale to 0-255 (increased sensitivity - rms * 4000)
+                        level = min(255, max(0, int(rms * 4000)))
+                        print(f"\r[LEVEL] {level:3d}", end="", flush=True)  # Debug output
+                        vio_controller.set_amplitude(level)
+                    except:
+                        pass
+                
+                # Start non-blocking input stream for level monitoring
+                audio_stream = sd.InputStream(
+                    callback=audio_level_callback,
+                    channels=1,
+                    samplerate=16000,
+                    blocksize=1024
+                )
+                audio_stream.start()
+            except Exception as e:
+                # Sounddevice not available, continue without level monitoring
+                pass
             
             try:
                 with mic as source:
                     # Wait for SPACE to be released, then capture what was said
                     # Use a longer timeout to capture the full phrase
                     audio = r.listen(source, timeout=10, phrase_time_limit=15)
-                    
             except sr.WaitTimeoutError:
-                print("No speech detected.")
+                print("\nNo speech detected.")
+                if audio_stream:
+                    audio_stream.stop()
+                    audio_stream.close()
                 update_state(STATE_IDLE)
+                vio_controller.set_amplitude(255)  # Reset to max
+                last_interaction_time = time.time()
                 continue
             except Exception as e:
-                print(f"Audio capture error: {e}")
+                print(f"\nAudio capture error: {e}")
+                if audio_stream:
+                    audio_stream.stop()
+                    audio_stream.close()
                 update_state(STATE_IDLE)
+                vio_controller.set_amplitude(255)  # Reset to max
+                last_interaction_time = time.time()
                 continue
+            
+            # Stop audio level monitoring
+            if audio_stream:
+                audio_stream.stop()
+                audio_stream.close()
+                audio_stream = None
+            
+            # Reset to IDLE amplitude (flat line)
+            vio_controller.set_amplitude(128)
+
+            # STATE: PROCESSING (Idle - flat line)
+            update_state(STATE_IDLE)
 
             # STATE: PROCESSING (Idle - flat line)
             update_state(STATE_IDLE)
@@ -376,7 +532,15 @@ def main():
                 raw_text = response.text
                 
                 # Parse mood and text
-                mood, ai_text = parse_response(raw_text)
+                mood, command, ai_text = parse_response(raw_text)
+                
+                if command.lower() == "game":
+                    print("[CMD] AI starting GAME mode...")
+                    # We speak first then launch game? Or launch game then speak?
+                    # Speaking requires blocking usually. Let's speak then launch.
+                    
+                elif command.lower() == "screensaver":
+                    print("[CMD] AI starting SCREENSAVER mode...")
                 
                 print(f"[{mood.upper()}] KAREN: {ai_text}")
 
@@ -399,10 +563,14 @@ def main():
                     use_local_tts = True
 
                 # STATE: SPEAKING - Use ANGRY state for angry mood, otherwise NEUTRAL
+
                 if mood.lower() == "angry":
                     update_state(STATE_ANGRY)  # Red, chaotic waveform
                 else:
                     update_state(STATE_NEUTRAL)  # Green, moderate waveform
+                
+                # Force amplitude to max so the waveform is visible (reset from listening)
+                vio_controller.set_amplitude(255)
                 
                 print("[SPEAKING]...")
                 # Play audio (ElevenLabs) or use local TTS
@@ -410,6 +578,16 @@ def main():
                     speak_local_tts(ai_text)
                 else:
                     play_audio_bytes(audio_data)
+
+                # Execute command if any (AFTER speaking)
+                if command.lower() == "game":
+                    time.sleep(0.5)
+                    run_game_mode()
+                    last_interaction_time = time.time()
+                elif command.lower() == "screensaver":
+                    time.sleep(0.5)
+                    run_screensaver_mode()
+                    last_interaction_time = time.time()
 
             except sr.UnknownValueError:
                 print("Could not understand audio")
@@ -422,6 +600,7 @@ def main():
                 
             # STATE: IDLE (Done talking)
             update_state(STATE_IDLE)
+            last_interaction_time = time.time()
 
         except KeyboardInterrupt:
             print("\nInterrupted by user.")

@@ -31,7 +31,7 @@ module video_uut (
     localparam LEFT_bound = H_RES / 8;           // 240 pixels
     localparam RIGHT_bound = (H_RES * 7) / 8;    // 1680 pixels
     localparam FADE_WIDTH = 120;                 // Fade zone width in pixels
-    localparam LINE_THICKNESS = 5;
+    localparam LINE_THICKNESS = 10;               // Thicker waveform line
     localparam INTERP_FRAMES = 180;              // ~3 seconds at 60fps (slower keyframes)
 
     // --- 3. SINE LUT ROM (64 entries for quarter wave, synthesis-friendly) ---
@@ -122,6 +122,24 @@ module video_uut (
     localparam COLUMN_WIDTH = 2;         // 2 pixels per column
     localparam NUM_COLUMNS = H_RES / COLUMN_WIDTH;  // 960 columns
     
+    // =========== LOGO ROM (for Screensaver) ===========
+    localparam LOGO_WIDTH  = 712;        // Logo width in pixels
+    localparam LOGO_HEIGHT = 400;        // Logo height in pixels
+    localparam LOGO_BYTES_PER_ROW = LOGO_WIDTH / 8;  // 89 bytes per row
+    localparam LOGO_TOTAL_BYTES = LOGO_BYTES_PER_ROW * LOGO_HEIGHT;  // 35600 bytes
+    
+    // Bouncing logo position (like DVD screensaver)
+    reg [11:0] logo_x, logo_y;           // Logo position (top-left corner)
+    reg signed [2:0] logo_vx, logo_vy;   // Logo velocity (-4 to +3)
+    reg [19:0] logo_timer;               // Timer for logo movement
+    localparam LOGO_MOVE_DELAY = 20'd1_000_000;  // ~6.7ms between moves (~12fps movement, 5x slower)
+    
+    // Logo ROM storage (1-bit packed, 8 pixels per byte)
+    reg [7:0] logo_rom [0:LOGO_TOTAL_BYTES-1];
+    initial begin
+        $readmemh("logo_rom.mem", logo_rom);
+    end
+    
     // =========== BREAKOUT GAME (State 5) ===========
     // Game area parameters
     localparam GAME_LEFT   = 160;        // Left margin
@@ -139,7 +157,7 @@ module video_uut (
     localparam PADDLE_WIDTH  = 200;
     localparam PADDLE_HEIGHT = 16;
     localparam PADDLE_Y      = GAME_BOTTOM - PADDLE_HEIGHT - 20;  // Fixed Y position
-    localparam PADDLE_SMOOTH = 4;        // Pixels per game tick to move (smoothing speed)
+    localparam PADDLE_SMOOTH = 2;        // Pixels per game tick to move (slower = smoother)
     reg [11:0] paddle_x;                 // Paddle X position (left edge)
     reg [11:0] target_paddle_x;          // Target paddle position (from input)
     
@@ -156,6 +174,13 @@ module video_uut (
     // Game timing
     reg [19:0] game_tick;                // Counter for game speed
     localparam GAME_SPEED = 20'd600_000; // ~4ms per game tick (very slow ball)
+    
+    // Game score counters
+    reg [7:0] balls_lost;                // Number of times ball fell off
+    reg [7:0] blocks_hit;                // Number of blocks destroyed
+    reg game_paused;                     // Game paused (win/lose)
+    reg game_won;                        // True if won, false if lost
+    
     
     // State-based parameters
     logic [23:0] state_color;
@@ -208,17 +233,18 @@ module video_uut (
                 base_freq_2 = 8'd0;
                 freq_var_bits = 4'd0;
             end
-            3'd1: begin // LISTENING - Higher freq, subtle
+            3'd1: begin // LISTENING - Higher freq, responsive
                 state_color = 24'h0000FF;      // Blue
-                base_amp = 8'd60;              // Subtle base
-                amp_var_bits = 4'd5;           // +/- 16
+                // Use input amplitude but keep a minimum of 20 so it's always visible
+                base_amp = (vio_amplitude_i < 8'd20) ? 8'd20 : vio_amplitude_i;
+                amp_var_bits = 4'd6;           // +/- 32
                 base_freq_1 = 8'd120;
                 base_freq_2 = 8'd140;
                 freq_var_bits = 4'd4;          // +/- 8
             end
             3'd2: begin // NEUTRAL - Higher freq, moderate
                 state_color = 24'h00FF00;      // Green
-                base_amp = 8'd100;             // Moderate base
+                base_amp = 8'd200;             // Larger base amplitude
                 amp_var_bits = 4'd6;           // +/- 32
                 base_freq_1 = 8'd150;
                 base_freq_2 = 8'd180;
@@ -226,7 +252,7 @@ module video_uut (
             end
             3'd3: begin // ANGRY - Much higher freq, chaotic
                 state_color = 24'hFF0000;      // Red
-                base_amp = 8'd200;             // High base
+                base_amp = 8'd255;             // Maximum amplitude
                 amp_var_bits = 4'd7;           // +/- 64
                 base_freq_1 = 8'd220;
                 base_freq_2 = 8'd250;
@@ -394,6 +420,18 @@ module video_uut (
             fill_column <= 11'd0;        // Start from left
             current_hue <= 8'd0;         // Initial hue
             prev_hue <= 8'd60;           // Previous color (starts different)
+            
+            // Bouncing logo initialization
+            logo_x <= 12'd100;           // Start near top-left
+            logo_y <= 12'd100;
+            logo_vx <= 3'd2;             // Moving right
+            logo_vy <= 3'd1;             // Moving down
+            logo_timer <= 20'd0;
+            
+            // Game counters
+            balls_lost <= 8'd0;
+            blocks_hit <= 8'd0;
+            
             x_cnt <= 12'd0; y_cnt <= 12'd0;
             prev_de <= 1'b0;
             vid_rgb_d1 <= 24'h000000;
@@ -425,6 +463,57 @@ module video_uut (
                         current_hue <= current_hue + 8'd43; // New fill color (43 is prime)
                     end
                 end
+                
+                // Bouncing logo movement (DVD-style)
+                logo_timer <= logo_timer + 1;
+                if (logo_timer >= LOGO_MOVE_DELAY) begin
+                    logo_timer <= 20'd0;
+                    
+                    // Move logo and bounce off walls
+                    // X axis movement
+                    if (logo_vx[2]) begin  // Moving left (negative)
+                        if (logo_x <= 5) begin
+                            // At left edge - bounce right
+                            logo_x <= 12'd0;
+                            logo_vx <= 3'd2;  // Go right
+                        end
+                        else begin
+                            logo_x <= logo_x - 12'd2;  // Move left by 2
+                        end
+                    end
+                    else begin  // Moving right (positive)
+                        if (logo_x >= (H_RES - LOGO_WIDTH - 5)) begin
+                            // At right edge - bounce left
+                            logo_x <= H_RES - LOGO_WIDTH;
+                            logo_vx <= -3'd2;  // Go left (signed negative)
+                        end
+                        else begin
+                            logo_x <= logo_x + 12'd2;  // Move right by 2
+                        end
+                    end
+                    
+                    // Y axis movement
+                    if (logo_vy[2]) begin  // Moving up (negative)
+                        if (logo_y <= 5) begin
+                            // At top edge - bounce down
+                            logo_y <= 12'd0;
+                            logo_vy <= 3'd1;  // Go down
+                        end
+                        else begin
+                            logo_y <= logo_y - 12'd1;  // Move up by 1
+                        end
+                    end
+                    else begin  // Moving down (positive)
+                        if (logo_y >= (V_RES - LOGO_HEIGHT - 5)) begin
+                            // At bottom edge - bounce up
+                            logo_y <= V_RES - LOGO_HEIGHT;
+                            logo_vy <= -3'd1;  // Go up (signed negative)
+                        end
+                        else begin
+                            logo_y <= logo_y + 12'd1;  // Move down by 1
+                        end
+                    end
+                end
             end
             else begin
                 // Not in screensaver - reset for next time
@@ -454,13 +543,15 @@ module video_uut (
                         paddle_x <= target_paddle_x;
                 end
                 
-                // Game tick counter
-                game_tick <= game_tick + 1;
-                
-                if (game_tick >= GAME_SPEED) begin
-                    game_tick <= 20'd0;
+                // Only run game physics if not paused
+                if (!game_paused) begin
+                    // Game tick counter
+                    game_tick <= game_tick + 1;
                     
-                    // Update ball position
+                    if (game_tick >= GAME_SPEED) begin
+                        game_tick <= 20'd0;
+                        
+                        // Update ball position
                     ball_x <= ball_x + {{7{ball_vx[4]}}, ball_vx};  // Sign-extend and add
                     ball_y <= ball_y + {{7{ball_vy[4]}}, ball_vy};
                     
@@ -480,7 +571,6 @@ module video_uut (
                         ball_y <= GAME_TOP + 1;
                         ball_vy <= -ball_vy;
                     end
-                    
                     // Paddle collision - only if ball is moving DOWN (vy positive, sign bit = 0)
                     if (!ball_vy[4] && ball_y + BALL_SIZE >= PADDLE_Y && ball_y + BALL_SIZE <= PADDLE_Y + PADDLE_HEIGHT) begin
                         if (ball_x + BALL_SIZE >= paddle_x && ball_x <= paddle_x + PADDLE_WIDTH) begin
@@ -495,35 +585,75 @@ module video_uut (
                         end
                     end
                     
-                    // Bottom (ball lost) - reset ball
+                    // Bottom (ball lost) - reset ball and increment counter
                     if (ball_y >= GAME_BOTTOM) begin
-                        ball_x <= (GAME_LEFT + GAME_RIGHT) / 2;
-                        ball_y <= PADDLE_Y - 100;
-                        ball_vx <= 5'd2;   // Slower ball
-                        ball_vy <= -5'd3;  // Slower ball
+                        balls_lost <= balls_lost + 1;  // Count lost balls
+                        // Check for game over (5 lives)
+                        if (balls_lost >= 8'd4) begin
+                            game_paused <= 1'b1;
+                            game_won <= 1'b0;  // Lost
+                        end
+                        else begin
+                            ball_x <= (GAME_LEFT + GAME_RIGHT) / 2;
+                            ball_y <= PADDLE_Y - 100;
+                            ball_vx <= 5'd2;
+                            ball_vy <= -5'd3;
+                        end
                     end
                     
-                    // Block collisions (simplified - check ball center)
+                    // Block collisions with proper side detection
                     begin
                         logic [3:0] block_col, block_row;
                         logic [5:0] block_idx;
+                        logic [11:0] block_left, block_right, block_top, block_bottom;
+                        logic [11:0] ball_cx, ball_cy;  // Ball center
+                        logic hit_from_top, hit_from_bottom, hit_from_side;
+                        
+                        ball_cx = ball_x + (BALL_SIZE / 2);
+                        ball_cy = ball_y + (BALL_SIZE / 2);
                         
                         // Calculate which block the ball center might be in
-                        if (ball_y >= BLOCKS_TOP && ball_y < BLOCKS_TOP + BLOCK_ROWS * BLOCK_HEIGHT) begin
-                            block_row = (ball_y - BLOCKS_TOP) / BLOCK_HEIGHT;
-                            if (ball_x >= GAME_LEFT && ball_x < GAME_LEFT + BLOCK_COLS * BLOCK_WIDTH) begin
-                                block_col = (ball_x - GAME_LEFT) / BLOCK_WIDTH;
+                        if (ball_cy >= BLOCKS_TOP && ball_cy < BLOCKS_TOP + BLOCK_ROWS * BLOCK_HEIGHT) begin
+                            block_row = (ball_cy - BLOCKS_TOP) / BLOCK_HEIGHT;
+                            if (ball_cx >= GAME_LEFT && ball_cx < GAME_LEFT + BLOCK_COLS * BLOCK_WIDTH) begin
+                                block_col = (ball_cx - GAME_LEFT) / BLOCK_WIDTH;
                                 block_idx = block_row * BLOCK_COLS + block_col;
                                 
                                 if (block_idx < 50 && blocks_alive[block_idx]) begin
+                                    // Calculate block bounds
+                                    block_left = GAME_LEFT + block_col * BLOCK_WIDTH + BLOCK_GAP;
+                                    block_right = block_left + BLOCK_WIDTH - 2*BLOCK_GAP;
+                                    block_top = BLOCKS_TOP + block_row * BLOCK_HEIGHT + BLOCK_GAP;
+                                    block_bottom = block_top + BLOCK_HEIGHT - 2*BLOCK_GAP;
+                                    
+                                    // Determine hit direction based on ball velocity and overlap
+                                    // If moving up and hit bottom of block, or moving down and hit top
+                                    hit_from_top = !ball_vy[4] && ball_y < block_top;  // Moving down, ball above block
+                                    hit_from_bottom = ball_vy[4] && ball_y + BALL_SIZE > block_bottom;  // Moving up, ball below
+                                    hit_from_side = !hit_from_top && !hit_from_bottom;
+                                    
                                     blocks_alive[block_idx] <= 1'b0;  // Break block
-                                    ball_vy <= -ball_vy;  // Bounce
+                                    blocks_hit <= blocks_hit + 1;  // Count hit blocks
+                                    
+                                    if (hit_from_side) begin
+                                        ball_vx <= -ball_vx;  // Side hit - reverse X
+                                    end
+                                    else begin
+                                        ball_vy <= -ball_vy;  // Top/bottom hit - reverse Y
+                                    end
+                                    
+                                    // Check for win (all 50 blocks destroyed)
+                                    if (blocks_hit >= 8'd49) begin
+                                        game_paused <= 1'b1;
+                                        game_won <= 1'b1;
+                                    end
                                 end
                             end
                         end
                     end
-                end
-            end
+                end  // if (game_tick >= GAME_SPEED)
+                end  // if (!game_paused)
+            end  // if (vio_state_i == 3'd5)
             else if (prev_state == 3'd5 && vio_state_i != 3'd5) begin
                 // Leaving game state - do nothing special
             end
@@ -536,10 +666,14 @@ module video_uut (
                 paddle_x <= (GAME_LEFT + GAME_RIGHT - PADDLE_WIDTH) / 2;
                 blocks_alive <= 50'h3FFFFFFFFFFFF;  // All 50 blocks alive
                 game_tick <= 20'd0;
+                balls_lost <= 8'd0;  // Reset counters
+                blocks_hit <= 8'd0;
+                game_paused <= 1'b0;
+                game_won <= 1'b0;
             end
 
-            // Detect state changes
-            prev_state <= vio_state_i;
+            // Detect state changes logic moved inside VSYNC block
+            // prev_state <= vio_state_i; // REMOVED from here
             
             // SYNC & COUNTERS
             prev_de <= dvh_sync_i[2]; 
@@ -565,8 +699,15 @@ module video_uut (
                     blend_factor <= 8'd0;
                     
                     frame_counter <= 0;
+                    
+                    // Update prev_state here so the difference is detected exactly once
+                    prev_state <= vio_state_i;
                 end
                 else begin
+                    // State hasn't changed, continue animation
+                    // Only update prev_state if we didn't just detecting a change (to avoid race)
+                    // Actually, we just need to keep tracking it.
+                    prev_state <= vio_state_i;
                     // === KEYFRAME SYSTEM: Every INTERP_FRAMES, update seeds and frequencies ===
                     if (frame_counter >= INTERP_FRAMES) begin
                         frame_counter <= 0;
@@ -621,9 +762,15 @@ module video_uut (
                     if (current_freq_2 < stable_freq_2) current_freq_2 <= current_freq_2 + 1;
                     else if (current_freq_2 > stable_freq_2) current_freq_2 <= current_freq_2 - 1;
 
-                    // Smoothly interpolate amplitude
-                    if (current_amp < target_amp) current_amp <= current_amp + 1;
-                    else if (current_amp > target_amp) current_amp <= current_amp - 1;
+                    // Smoothly interpolate amplitude (faster ramp: +4 instead of +1)
+                    if (current_amp < target_amp) begin
+                         if (target_amp - current_amp > 4) current_amp <= current_amp + 4;
+                         else current_amp <= target_amp;
+                    end
+                    else if (current_amp > target_amp) begin
+                         if (current_amp - target_amp > 4) current_amp <= current_amp - 4;
+                         else current_amp <= target_amp;
+                    end
                 end
             end 
             else if (dvh_sync_i[2]) begin 
@@ -638,7 +785,8 @@ module video_uut (
             // Check which mode we're in
             if (vio_state_i == 3'd5) begin
                 // === BREAKOUT GAME MODE (State 5) ===
-                logic draw_ball, draw_paddle, draw_block, draw_wall;
+                logic draw_ball, draw_paddle, draw_block, draw_wall, in_game_area;
+                logic draw_gui;
                 logic [3:0] blk_col, blk_row;
                 logic [5:0] blk_idx;
                 logic [23:0] block_color;
@@ -646,10 +794,23 @@ module video_uut (
                 logic [12:0] bg_dist;
                 logic [7:0] bg_blue;
                 
+                // GUI digit rendering helpers
+                logic [3:0] digit_val;
+                logic [7:0] digit_x, digit_y;  // Position within digit
+                logic in_digit, pixel_on;
+                
+                // Endgame display variables
+                logic draw_endgame_box, draw_endgame_text;
+                logic [11:0] box_left, box_right, box_top, box_bottom;
+                logic [11:0] text_x, text_y;
+                
                 draw_ball = 1'b0;
                 draw_paddle = 1'b0;
                 draw_block = 1'b0;
                 draw_wall = 1'b0;
+                draw_gui = 1'b0;
+                in_game_area = (x_cnt > GAME_LEFT && x_cnt < GAME_RIGHT-1 && 
+                               y_cnt > GAME_TOP && y_cnt < GAME_BOTTOM);
                 
                 // Check if drawing ball
                 if (x_cnt >= ball_x && x_cnt < ball_x + BALL_SIZE &&
@@ -705,14 +866,77 @@ module video_uut (
                     end
                 end
                 
-                // Check if on game boundary walls
-                if (x_cnt == GAME_LEFT || x_cnt == GAME_RIGHT-1 ||
-                    y_cnt == GAME_TOP) begin
-                    draw_wall = 1'b1;
+                // Simple GUI: Show "LOST: X" on left, "HIT: X" on right using boxes
+                // Left side GUI area (x: 20-140, y: 30-70)
+                if (x_cnt >= 20 && x_cnt < 140 && y_cnt >= 30 && y_cnt < 70) begin
+                    // Draw balls_lost as simple filled rectangles (1 per lost ball, max 10)
+                    digit_x = x_cnt - 20;
+                    if (digit_x < balls_lost * 12 && digit_x % 12 < 10) begin
+                        draw_gui = 1'b1;
+                    end
                 end
                 
-                // Draw priority: Ball > Paddle > Blocks > Walls > Background
-                if (draw_ball) begin
+                // Right side GUI area (x: 1780-1900, y: 30-70)
+                if (x_cnt >= 1780 && x_cnt < 1900 && y_cnt >= 30 && y_cnt < 70) begin
+                    // Draw blocks_hit as simple filled rectangles
+                    digit_x = x_cnt - 1780;
+                    if (digit_x < (blocks_hit > 99 ? 99 : blocks_hit) && (digit_x % 2 == 0)) begin
+                        draw_gui = 1'b1;
+                    end
+                end
+                
+                // Game over / You win display (centered box)
+                draw_endgame_box = 1'b0;
+                draw_endgame_text = 1'b0;
+                
+                // Box dimensions: 600x200, centered
+                box_left = (H_RES - 600) / 2;
+                box_right = box_left + 600;
+                box_top = (V_RES - 200) / 2;
+                box_bottom = box_top + 200;
+                
+                if (game_paused) begin
+                    if (x_cnt >= box_left && x_cnt < box_right &&
+                        y_cnt >= box_top && y_cnt < box_bottom) begin
+                        // Border (15px thick)
+                        if (x_cnt < box_left + 15 || x_cnt >= box_right - 15 ||
+                            y_cnt < box_top + 15 || y_cnt >= box_bottom - 15) begin
+                            draw_endgame_box = 1'b1;
+                        end
+                        else begin
+                            // Inner area = 570 x 170, centered text
+                            text_x = x_cnt - box_left - 15;
+                            text_y = y_cnt - box_top - 15;
+                            // Draw large text indicators
+                            if (game_won) begin
+                                // Three tall vertical bars for WIN (spread across 570px)
+                                // Bar 1: 80-130, Bar 2: 255-305, Bar 3: 430-480
+                                if (((text_x >= 80 && text_x < 130) ||
+                                     (text_x >= 255 && text_x < 305) ||
+                                     (text_x >= 430 && text_x < 480)) &&
+                                    (text_y >= 30 && text_y < 140)) begin
+                                    draw_endgame_text = 1'b1;
+                                end
+                            end
+                            else begin
+                                // Large horizontal bar across middle for LOSE
+                                if (text_x >= 50 && text_x < 520 &&
+                                    text_y >= 65 && text_y < 105) begin
+                                    draw_endgame_text = 1'b1;
+                                end
+                            end
+                        end
+                    end
+                end
+                
+                // Draw priority: EndGame > Ball > Paddle > Blocks > GUI > Background
+                if (draw_endgame_box) begin
+                    vid_rgb_d1 <= game_won ? 24'h00FF00 : 24'hFF0000;  // Green for win, red for lose
+                end
+                else if (draw_endgame_text) begin
+                    vid_rgb_d1 <= 24'hFFFFFF;  // White text
+                end
+                else if (draw_ball) begin
                     vid_rgb_d1 <= 24'hFFFFFF;  // White ball
                 end
                 else if (draw_paddle) begin
@@ -721,11 +945,15 @@ module video_uut (
                 else if (draw_block) begin
                     vid_rgb_d1 <= block_color;
                 end
-                else if (draw_wall) begin
-                    vid_rgb_d1 <= 24'h404040;  // Gray walls
+                else if (draw_gui) begin
+                    vid_rgb_d1 <= 24'hFF6600;  // Orange GUI elements
+                end
+                else if (!in_game_area) begin
+                    // Outside game area = black
+                    vid_rgb_d1 <= 24'h000000;
                 end
                 else begin
-                    // Radial gradient background (same as normal mode)
+                    // Inside game area: Radial gradient background
                     abs_dx = (x_cnt > H_CENTER) ? (x_cnt - H_CENTER) : (H_CENTER - x_cnt);
                     abs_dy = (y_cnt > V_CENTER) ? (y_cnt - V_CENTER) : (V_CENTER - y_cnt);
                     bg_dist = abs_dx + abs_dy;
@@ -745,36 +973,88 @@ module video_uut (
                 // === SCREENSAVER MODE (State 4) ===
                 logic [10:0] pixel_column;   // Which 2px column is this pixel in
                 logic [23:0] base_curr, base_prev;  // Base saturated colors
-                logic [23:0] pastel_curr, pastel_prev;  // Light pastel versions
+                logic [23:0] dark_curr, dark_prev;  // Dark muted versions
+                logic [23:0] blended_color;         // Fade-wipe result
+                logic [7:0]  blend_t;               // Blend factor 0-255
+                logic signed [11:0] dist_from_edge; // Distance from fill edge
+                
+                // Logo lookup variables (using dynamic bouncing position)
+                logic in_logo_bounds;
+                logic [11:0] logo_local_x, logo_local_y;
+                logic [15:0] logo_byte_addr;
+                logic [7:0]  logo_byte;
+                logic [2:0]  logo_bit_idx;
+                logic        logo_pixel;
+                
+                // Fade zone width in 2px columns
+                localparam FADE_ZONE = 30;  // 60 pixels fade zone
                 
                 // Calculate which column we're in
                 pixel_column = x_cnt / COLUMN_WIDTH;
+                
+                // Check if we're within logo bounds (using DYNAMIC logo_x, logo_y)
+                in_logo_bounds = (x_cnt >= logo_x) && (x_cnt < logo_x + LOGO_WIDTH) &&
+                                 (y_cnt >= logo_y) && (y_cnt < logo_y + LOGO_HEIGHT);
+                
+                // Calculate logo local coordinates
+                logo_local_x = x_cnt - logo_x;
+                logo_local_y = y_cnt - logo_y;
+                
+                // Calculate byte address and bit index within byte
+                logo_byte_addr = logo_local_y * LOGO_BYTES_PER_ROW + (logo_local_x >> 3);
+                logo_bit_idx = 3'd7 - logo_local_x[2:0];  // MSB first
+                
+                // Read logo pixel from ROM
+                logo_byte = logo_rom[logo_byte_addr];
+                logo_pixel = logo_byte[logo_bit_idx];
                 
                 // Get base colors from hues
                 base_curr = hue_to_rgb(current_hue);
                 base_prev = hue_to_rgb(prev_hue);
                 
-                // Create very light pastel: (color / 4) + 0xC0C0C0 (75% white)
-                pastel_curr = {
-                    2'b00, base_curr[23:18], // R: quarter
-                    2'b00, base_curr[15:10], // G: quarter
-                    2'b00, base_curr[7:2]    // B: quarter
-                } + 24'hC0C0C0;              // Add lots of white for light pastel
+                // Create VERY dark muted colors: (color / 8) for subtle, moody look
+                dark_curr = {
+                    3'b000, base_curr[23:19], // R: 1/8
+                    3'b000, base_curr[15:11], // G: 1/8
+                    3'b000, base_curr[7:3]    // B: 1/8
+                };
                 
-                pastel_prev = {
-                    2'b00, base_prev[23:18], // R: quarter
-                    2'b00, base_prev[15:10], // G: quarter
-                    2'b00, base_prev[7:2]    // B: quarter
-                } + 24'hC0C0C0;              // Add lots of white for light pastel
+                dark_prev = {
+                    3'b000, base_prev[23:19], // R: 1/8
+                    3'b000, base_prev[15:11], // G: 1/8
+                    3'b000, base_prev[7:3]    // B: 1/8
+                };
                 
-                // Show current color if filled, otherwise show previous color
-                if (pixel_column < fill_column) begin
-                    // This column is filled with new color
-                    vid_rgb_d1 <= pastel_curr;
+                // Calculate distance from fill edge for fade-wipe
+                dist_from_edge = $signed({1'b0, fill_column}) - $signed({1'b0, pixel_column});
+                
+                // Determine blend factor based on distance from edge
+                if (dist_from_edge >= FADE_ZONE) begin
+                    // Fully in new color zone
+                    blend_t = 8'd255;
+                end
+                else if (dist_from_edge <= 0) begin
+                    // Fully in old color zone
+                    blend_t = 8'd0;
                 end
                 else begin
-                    // This column still has previous color
-                    vid_rgb_d1 <= pastel_prev;
+                    // In fade zone - linear interpolation
+                    blend_t = (dist_from_edge * 255) / FADE_ZONE;
+                end
+                
+                // Blend colors: result = prev + (curr - prev) * blend_t / 256
+                blended_color = {
+                    dark_prev[23:16] + (((dark_curr[23:16] - dark_prev[23:16]) * blend_t) >> 8),
+                    dark_prev[15:8]  + (((dark_curr[15:8]  - dark_prev[15:8])  * blend_t) >> 8),
+                    dark_prev[7:0]   + (((dark_curr[7:0]   - dark_prev[7:0])   * blend_t) >> 8)
+                };
+                
+                // Display: logo (white) takes priority over background
+                if (in_logo_bounds && logo_pixel) begin
+                    vid_rgb_d1 <= 24'hFFFFFF;  // Solid white logo
+                end
+                else begin
+                    vid_rgb_d1 <= blended_color;
                 end
             end
             else if ( (y_cnt >= (target_y - (LINE_THICKNESS>>1))) && 
