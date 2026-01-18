@@ -1,0 +1,7 @@
+fpga_top/
+rtl_ross/
+*.log
+*.jou
+*.lpr
+*.env
+*.txt
