@@ -139,7 +139,9 @@ module video_uut (
     localparam PADDLE_WIDTH  = 200;
     localparam PADDLE_HEIGHT = 16;
     localparam PADDLE_Y      = GAME_BOTTOM - PADDLE_HEIGHT - 20;  // Fixed Y position
+    localparam PADDLE_SMOOTH = 4;        // Pixels per game tick to move (smoothing speed)
     reg [11:0] paddle_x;                 // Paddle X position (left edge)
+    reg [11:0] target_paddle_x;          // Target paddle position (from input)
     
     // Block parameters - 10 columns x 5 rows = 50 blocks
     localparam BLOCK_COLS   = 10;
@@ -434,9 +436,23 @@ module video_uut (
             
             // =========== BREAKOUT GAME LOGIC (State 5) ===========
             if (vio_state_i == 3'd5) begin
-                // Update paddle position from VIO amplitude (0-255 -> paddle X range)
+                // Calculate target paddle position from VIO amplitude (0-255 -> paddle X range)
                 // Map 0-255 to GAME_LEFT to GAME_RIGHT-PADDLE_WIDTH
-                paddle_x <= GAME_LEFT + ((vio_amplitude_i * (GAME_WIDTH - PADDLE_WIDTH)) >> 8);
+                target_paddle_x <= GAME_LEFT + ((vio_amplitude_i * (GAME_WIDTH - PADDLE_WIDTH)) >> 8);
+                
+                // Smoothly move paddle toward target (reduces jitter from noisy input)
+                if (paddle_x < target_paddle_x) begin
+                    if (target_paddle_x - paddle_x > PADDLE_SMOOTH)
+                        paddle_x <= paddle_x + PADDLE_SMOOTH;
+                    else
+                        paddle_x <= target_paddle_x;
+                end
+                else if (paddle_x > target_paddle_x) begin
+                    if (paddle_x - target_paddle_x > PADDLE_SMOOTH)
+                        paddle_x <= paddle_x - PADDLE_SMOOTH;
+                    else
+                        paddle_x <= target_paddle_x;
+                end
                 
                 // Game tick counter
                 game_tick <= game_tick + 1;
